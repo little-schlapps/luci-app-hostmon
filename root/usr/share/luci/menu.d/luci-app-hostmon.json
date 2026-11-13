@@ -1,0 +1,13 @@
+{
+	"admin/status/hostmon": {
+		"title": "Host Monitor",
+		"order": 65,
+		"action": {
+			"type": "view",
+			"path": "hostmon/host"
+		},
+		"depends": {
+			"acl": [ "luci-app-hostmon" ]
+		}
+	}
+}

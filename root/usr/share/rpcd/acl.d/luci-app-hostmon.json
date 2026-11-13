@@ -1,0 +1,11 @@
+{
+	"luci-app-hostmon": {
+		"description": "Grant access to the per-host traffic monitor",
+		"read": {
+			"ubus": {
+				"luci.hostmon": [ "rate", "conns", "host", "crowdsec" ],
+				"luci-rpc": [ "getDHCPLeases" ]
+			}
+		}
+	}
+}

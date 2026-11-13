@@ -1,0 +1,389 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// rpcd ucode backend for luci-app-hostmon: per-host traffic monitor.
+//
+//  rate   - byte/packet counters for one IPv4 host from a private nftables
+//           table (inet luci_hostmon). Rules are added on first request and
+//           removed after IDLE_SECS without a request, so nothing is left
+//           counting once the page is closed.
+//  conns  - the host's current conntrack entries.
+//  host   - lease, static lease, bridge port, nlbwmon totals and top
+//           protocols/ports, Snort alerts and addrwatch sightings.
+//  crowdsec - CrowdSec decisions for the host (slow, so separate).
+
+'use strict';
+
+import { popen, readfile, writefile, mkdir, unlink, stat, lsdir, open } from 'fs';
+import { cursor } from 'uci';
+
+const TABLE = 'luci_hostmon';
+const STATE = '/tmp/luci-hostmon';
+const IDLE_SECS = 300;
+const MAX_CONNS = 400;
+
+function run(cmd) {
+	const p = popen(cmd, 'r');
+	if (!p)
+		return '';
+	const out = p.read('all') ?? '';
+	p.close();
+	return out;
+}
+
+function jrun(cmd) {
+	try { return json(run(cmd)); } catch (e) { return null; }
+}
+
+// Strict dotted-quad IPv4; nothing else ever reaches a shell or nft.
+function valid_ip(ip) {
+	if (type(ip) != 'string')
+		return false;
+
+	const m = match(ip, /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
+	if (!m)
+		return false;
+
+	for (let i = 1; i <= 4; i++)
+		if (int(m[i]) > 255)
+			return false;
+
+	return true;
+}
+
+function uptime() {
+	return +(split(trim(readfile('/proc/uptime') ?? '0'), ' ')[0]);
+}
+
+// ---------------------------------------------------------------- nft rate counters
+
+function ensure_table() {
+	if (system(`nft list table inet ${TABLE} >/dev/null 2>&1`) == 0)
+		return;
+
+	writefile(`${STATE}/table.nft`,
+		`table inet ${TABLE} {\n` +
+		`  chain hm_forward { type filter hook forward priority filter - 5; policy accept; }\n` +
+		`  chain hm_input { type filter hook input priority filter - 5; policy accept; }\n` +
+		`  chain hm_output { type filter hook output priority filter - 5; policy accept; }\n` +
+		`}\n`);
+	system(`nft -f ${STATE}/table.nft >/dev/null 2>&1`);
+}
+
+function list_rules() {
+	const rules = [];
+	const j = jrun(`nft -j list table inet ${TABLE} 2>/dev/null`);
+
+	for (let e in j?.nftables ?? []) {
+		const r = e?.rule;
+		if (!r || !r.comment)
+			continue;
+
+		const m = match(r.comment, /^hm (\S+) (rx|tx)$/);
+		if (!m)
+			continue;
+
+		let bytes = 0, packets = 0;
+		for (let x in r.expr ?? [])
+			if (x?.counter) {
+				bytes = x.counter.bytes;
+				packets = x.counter.packets;
+			}
+
+		push(rules, { ip: m[1], dir: m[2], chain: r.chain, handle: r.handle, bytes: bytes, packets: packets });
+	}
+
+	return rules;
+}
+
+function add_rules(ip) {
+	let cmds = '';
+
+	for (let chain in [ 'hm_forward', 'hm_input', 'hm_output' ]) {
+		cmds += `add rule inet ${TABLE} ${chain} ip saddr ${ip} counter comment "hm ${ip} tx"\n`;
+		cmds += `add rule inet ${TABLE} ${chain} ip daddr ${ip} counter comment "hm ${ip} rx"\n`;
+	}
+
+	writefile(`${STATE}/add.nft`, cmds);
+	system(`nft -f ${STATE}/add.nft >/dev/null 2>&1`);
+}
+
+// Drop counters for hosts nobody has looked at recently; drop the table when empty.
+function garbage_collect(rules) {
+	const now = time();
+	let left = 0;
+
+	for (let r in rules) {
+		const st = stat(`${STATE}/seen.${r.ip}`);
+		if (st && now - st.mtime < IDLE_SECS) {
+			left++;
+			continue;
+		}
+
+		system(`nft delete rule inet ${TABLE} ${r.chain} handle ${int(r.handle)} >/dev/null 2>&1`);
+		unlink(`${STATE}/seen.${r.ip}`);
+	}
+
+	if (!left)
+		system(`nft delete table inet ${TABLE} >/dev/null 2>&1`);
+}
+
+// ---------------------------------------------------------------- helpers for host()
+
+function lease_for(ip) {
+	for (let l in split(readfile('/tmp/dhcp.leases') ?? '', '\n')) {
+		const f = split(l, ' ');
+		if (f[2] == ip)
+			return { expires: int(f[0]), mac: lc(f[1]), hostname: f[3] != '*' ? f[3] : null };
+	}
+
+	return null;
+}
+
+function static_for(ip, mac) {
+	const c = cursor();
+	let found = null;
+
+	c.foreach('dhcp', 'host', (s) => {
+		const macs = type(s.mac) == 'array' ? s.mac : split(s.mac ?? '', ' ');
+		if (s.ip == ip || (mac && index(map(macs, lc), mac) >= 0))
+			found = { name: s.name, ip: s.ip, mac: join(' ', macs) };
+	});
+
+	return found;
+}
+
+function neigh_for(ip) {
+	const m = match(run(`ip -4 neigh show ${ip} 2>/dev/null`), /dev (\S+) lladdr (\S+) (\S+)/);
+	return m ? { dev: m[1], mac: lc(m[2]), state: m[3] } : null;
+}
+
+// Which bridge port the MAC was last seen on (brctl showmacs + brif port numbers).
+function port_for(mac) {
+	if (!mac)
+		return null;
+
+	for (let br in lsdir('/sys/class/net') ?? []) {
+		const brif = lsdir(`/sys/class/net/${br}/brif`);
+		if (!brif)
+			continue;
+
+		const ports = {};
+		for (let p in brif)
+			ports[int(replace(trim(readfile(`/sys/class/net/${br}/brif/${p}/port_no`) ?? '0'), /^0x/, ''), 16)] = p;
+
+		for (let l in split(run(`brctl showmacs ${br} 2>/dev/null`), '\n')) {
+			const f = split(trim(l), /\s+/);
+			if (lc(f[1] ?? '') == mac && f[2] == 'no')
+				return { bridge: br, port: ports[int(f[0])] ?? f[0], ageing: f[3] };
+		}
+	}
+
+	return null;
+}
+
+function nlbw(ip) {
+	const res = { total: null, top: [] };
+	const t = jrun(`nlbw -c json -g ip 2>/dev/null`);
+
+	for (let r in t?.data ?? [])
+		if (r[0] == ip)
+			res.total = { conns: r[1], rx_bytes: r[2], rx_pkts: r[3], tx_bytes: r[4], tx_pkts: r[5] };
+
+	const g = jrun(`nlbw -c json -g ip,proto,port 2>/dev/null`);
+	const rows = [];
+
+	for (let r in g?.data ?? [])
+		if (r[2] == ip)
+			push(rows, { proto: r[0], port: r[1], conns: r[3], rx_bytes: r[4], tx_bytes: r[6] });
+
+	res.top = slice(sort(rows, (a, b) => (b.rx_bytes + b.tx_bytes) - (a.rx_bytes + a.tx_bytes)), 0, 15);
+	return res;
+}
+
+function snort_alerts(ip) {
+	const c = cursor();
+	const dir = c.get('snort', 'snort', 'log_dir') ?? '/var/log';
+	const fh = open(`${dir}/alert_json.txt`, 'r');
+	const out = [];
+	let total = 0;
+
+	if (!fh)
+		return { total: 0, recent: [] };
+
+	for (let l = fh.read('line'); length(l); l = fh.read('line')) {
+		if (index(l, `"${ip}"`) < 0)
+			continue;
+
+		let a;
+		try { a = json(l); } catch (e) { continue; }
+
+		if (a.src_addr != ip && a.dst_addr != ip)
+			continue;
+
+		total++;
+		push(out, { time: a.timestamp, msg: a.msg, src: a.src_addr, sport: a.src_port, dst: a.dst_addr, dport: a.dst_port, proto: a.proto, sid: a.sid, priority: a.priority });
+		if (length(out) > 20)
+			shift(out);
+	}
+
+	fh.close();
+	return { total: total, recent: reverse(out) };
+}
+
+function addrwatch(ip, mac) {
+	const seen = [];
+
+	for (let l in split(run(`logread -e addrwatch 2>/dev/null | grep -F ' ${ip} ' | tail -n 200`), '\n')) {
+		const m = match(l, /^(\w{3} \w{3} +\d+ [\d:]+ \d{4}) .*addrwatch: \d+ (\S+) \d+ (\S+) (\S+) (\S+)$/);
+		if (m && m[4] == ip)
+			push(seen, { time: m[1], iface: m[2], mac: lc(m[3]), type: m[5] });
+	}
+
+	const macs = {};
+	for (let s in seen)
+		macs[s.mac] = true;
+
+	return {
+		first: seen[0]?.time, last: seen[-1]?.time, count: length(seen),
+		other_macs: filter(keys(macs), (m) => m != mac)
+	};
+}
+
+// ---------------------------------------------------------------- methods
+
+const methods = {
+	rate: {
+		args: { ip: '' },
+		call: function(req) {
+			const ip = req.args?.ip;
+			if (!valid_ip(ip))
+				return { error: 'invalid address' };
+
+			mkdir(STATE);
+			writefile(`${STATE}/seen.${ip}`, '');
+			ensure_table();
+
+			let rules = list_rules();
+			if (!length(filter(rules, (r) => r.ip == ip))) {
+				add_rules(ip);
+				rules = list_rules();
+			}
+
+			const res = { ip: ip, uptime: uptime(), rx_bytes: 0, tx_bytes: 0, rx_packets: 0, tx_packets: 0, fresh: false };
+
+			for (let r in rules)
+				if (r.ip == ip) {
+					res[`${r.dir}_bytes`] += r.bytes;
+					res[`${r.dir}_packets`] += r.packets;
+				}
+
+			// This host's seen-file was just touched, so its rules always survive.
+			garbage_collect(rules);
+			return res;
+		}
+	},
+
+	conns: {
+		args: { ip: '' },
+		call: function(req) {
+			const ip = req.args?.ip;
+			if (!valid_ip(ip))
+				return { error: 'invalid address' };
+
+			const fh = open('/proc/net/nf_conntrack', 'r');
+			const conns = [];
+			let total = 0;
+
+			for (let l = fh?.read('line'); length(l); l = fh.read('line')) {
+				if (index(l, `=${ip} `) < 0)
+					continue;
+
+				const f = split(trim(l), /\s+/);
+				const c = { proto: f[2], state: null, assured: index(l, '[ASSURED]') >= 0 };
+				const kv = [];
+				let cur = null;
+
+				// Two tuples: original then reply, each src dst [sport dport] packets bytes.
+				for (let w in f) {
+					const m = match(w, /^(src|dst|sport|dport|packets|bytes|type|code)=(.*)$/);
+					if (m) {
+						if (m[1] == 'src')
+							push(kv, cur = {});
+						cur[m[1]] = m[2];
+					}
+					else if (match(w, /^[A-Z_]+$/) && !c.state && w != 'ASSURED')
+						c.state = w;
+				}
+
+				const o = kv[0] ?? {}, r = kv[1] ?? {};
+				if (o.src != ip && o.dst != ip && r.src != ip && r.dst != ip)
+					continue;
+
+				total++;
+				if (length(conns) >= MAX_CONNS)
+					continue;
+
+				// Outbound when the host started the flow (or is the reply source after DNAT).
+				const outbound = (o.src == ip);
+				push(conns, {
+					proto: c.proto, state: c.state, assured: c.assured,
+					direction: outbound ? 'out' : 'in',
+					local_port: int(outbound ? o.sport : (r.src == ip ? r.sport : o.dport)),
+					remote: outbound ? o.dst : o.src,
+					remote_port: int(outbound ? o.dport : o.sport),
+					tx_bytes: int(outbound ? o.bytes : r.bytes),
+					rx_bytes: int(outbound ? r.bytes : o.bytes)
+				});
+			}
+
+			fh?.close();
+			return { ip: ip, total: total, conns: sort(conns, (a, b) => (b.rx_bytes + b.tx_bytes) - (a.rx_bytes + a.tx_bytes)) };
+		}
+	},
+
+	host: {
+		args: { ip: '' },
+		call: function(req) {
+			const ip = req.args?.ip;
+			if (!valid_ip(ip))
+				return { error: 'invalid address' };
+
+			const lease = lease_for(ip);
+			const neigh = neigh_for(ip);
+			const mac = lease?.mac ?? neigh?.mac;
+
+			return {
+				ip: ip,
+				lease: lease,
+				static_lease: static_for(ip, mac),
+				neigh: neigh,
+				port: port_for(mac),
+				nlbw: nlbw(ip),
+				snort: snort_alerts(ip),
+				addrwatch: addrwatch(ip, mac)
+			};
+		}
+	},
+
+	crowdsec: {
+		args: { ip: '' },
+		call: function(req) {
+			const ip = req.args?.ip;
+			if (!valid_ip(ip))
+				return { error: 'invalid address' };
+			if (!stat('/usr/bin/cscli'))
+				return { available: false };
+
+			// --ip returns whole alerts (a CAPI hit carries every community decision): keep only this IP.
+			const rows = [];
+			for (let a in jrun(`/usr/bin/cscli decisions list -a --ip ${ip} -o json 2>/dev/null`) ?? [])
+				for (let d in a?.decisions ?? [])
+					if (d.value == ip || d.value == `${ip}/32`)
+						push(rows, { type: d.type, origin: d.origin, scenario: d.scenario, duration: d.duration });
+
+			return { available: true, decisions: rows };
+		}
+	}
+};
+
+return { 'luci.hostmon': methods };

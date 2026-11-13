@@ -3,7 +3,7 @@
 		"description": "Grant access to the per-host traffic monitor",
 		"read": {
 			"ubus": {
-				"luci.hostmon": [ "rate", "conns", "host", "crowdsec" ],
+				"luci.hostmon": [ "rate", "conns", "host", "names", "crowdsec" ],
 				"luci-rpc": [ "getDHCPLeases" ]
 			}
 		}

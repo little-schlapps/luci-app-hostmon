@@ -249,6 +249,171 @@ function addrwatch(ip, mac) {
 	};
 }
 
+// ---------------------------------------------------------------- name resolution
+
+const QUERYLOG_LINES = 4000;
+const PTR_TTL = 3600;
+const PTR_MAX_PER_CALL = 12;
+
+// AdGuard Home's query log directory, from its config (querylog.dir_path, else work_dir/data).
+function querylog_files() {
+	const c = cursor();
+	const conf = c.get('adguardhome', 'config', 'config_file') ?? '/etc/adguardhome/adguardhome.yaml';
+	const work = c.get('adguardhome', 'config', 'work_dir') ?? '/var/lib/adguardhome';
+	let dir = null, in_ql = false;
+
+	// Find querylog.dir_path in the YAML (top-level "querylog:" block, two-space indent).
+	for (let l in split(readfile(conf) ?? '', '\n')) {
+		if (match(l, /^[^ #]/))
+			in_ql = (l == 'querylog:');
+		else if (in_ql) {
+			const m = match(l, /^  dir_path: *"?([^"]*)"?$/);
+			if (m)
+				dir = m[1];
+		}
+	}
+
+	if (!dir || !length(dir))
+		dir = `${work}/data`;
+
+	return filter([ `${dir}/querylog.json.1`, `${dir}/querylog.json` ], (f) => stat(f) != null);
+}
+
+function u16(s, o) {
+	return (ord(s, o) << 8) | ord(s, o + 1);
+}
+
+function skip_name(s, o) {
+	for (let n = 0; n < 128 && o < length(s); n++) {
+		const l = ord(s, o);
+		if (l == 0)
+			return o + 1;
+		if ((l & 0xC0) == 0xC0)
+			return o + 2;
+		o += l + 1;
+	}
+
+	return -1;
+}
+
+// IPv4 addresses from the A records of a DNS response in wire format.
+function a_records(msg) {
+	const out = [];
+
+	if (type(msg) != 'string' || length(msg) < 12)
+		return out;
+
+	const qd = u16(msg, 4), an = u16(msg, 6);
+	let o = 12;
+
+	for (let i = 0; i < qd && o >= 0; i++)
+		o = skip_name(msg, o) + 4;
+
+	for (let i = 0; i < an && o > 0 && o + 10 <= length(msg); i++) {
+		o = skip_name(msg, o);
+		if (o < 0 || o + 10 > length(msg))
+			break;
+
+		const t = u16(msg, o), rdlen = u16(msg, o + 8);
+		o += 10;
+
+		if (t == 1 && rdlen == 4 && o + 4 <= length(msg))
+			push(out, sprintf('%d.%d.%d.%d', ord(msg, o), ord(msg, o + 1), ord(msg, o + 2), ord(msg, o + 3)));
+
+		o += rdlen;
+	}
+
+	return out;
+}
+
+// addr -> queried name, newest wins. grep_client limits to one client's lookups.
+function dns_names(files, wanted, grep_client) {
+	const found = {};
+
+	if (!length(files))
+		return found;
+
+	const sel = grep_client ? `grep -hF '"IP":"${grep_client}"' ${join(' ', files)}` : `cat ${join(' ', files)}`;
+
+	for (let l in split(run(`${sel} 2>/dev/null | grep -F '"QT":"A"' | tail -n ${QUERYLOG_LINES}`), '\n')) {
+		const qh = match(l, /"QH":"([^"]+)"/)?.[1];
+		const ans = match(l, /"Answer":"([^"]+)"/)?.[1];
+		if (!qh || !ans)
+			continue;
+
+		for (let a in a_records(b64dec(ans)))
+			if (wanted[a])
+				found[a] = qh;
+	}
+
+	return found;
+}
+
+function local_names() {
+	const names = {};
+
+	for (let l in split(readfile('/tmp/dhcp.leases') ?? '', '\n')) {
+		const f = split(l, ' ');
+		if (f[2] && f[3] && f[3] != '*')
+			names[f[2]] = f[3];
+	}
+
+	cursor().foreach('dhcp', 'host', (s) => { if (s.ip && s.name) names[s.ip] = s.name; });
+	cursor().foreach('network', 'interface', (s) => {
+		// ipaddr is a string or a list, optionally with /prefix.
+		for (let a in (type(s.ipaddr) == 'array' ? s.ipaddr : [ s.ipaddr ?? '' ])) {
+			const ip = split(a, '/')[0];
+			if (valid_ip(ip))
+				names[ip] = trim(readfile('/proc/sys/kernel/hostname') ?? 'router');
+		}
+	});
+
+	return names;
+}
+
+// Reverse DNS through the local resolver, in parallel, cached (including misses).
+function ptr_names(addrs) {
+	const file = `${STATE}/ptr.json`;
+	let cache = {};
+	try { cache = json(readfile(file) ?? '{}') ?? {}; } catch (e) { cache = {}; }
+
+	const now = time();
+	const todo = slice(filter(addrs, (a) => !cache[a] || now - cache[a].t > PTR_TTL), 0, PTR_MAX_PER_CALL);
+
+	if (length(todo)) {
+		let sh = '';
+		for (let a in todo)
+			sh += `( n=$(timeout 3 nslookup ${a} 127.0.0.1 2>/dev/null | sed -n 's/.*name = \\([^ ]*[^. ]\\)\\.\\{0,1\\}$/\\1/p' | head -n1); echo "${a} $n" ) &\n`;
+		sh += 'wait\n';
+
+		writefile(`${STATE}/ptr.sh`, sh);
+		for (let l in split(run(`sh ${STATE}/ptr.sh`), '\n')) {
+			const f = split(trim(l), ' ');
+			if (valid_ip(f[0]))
+				cache[f[0]] = { n: f[1] ?? '', t: now };
+		}
+
+		for (let a in todo)
+			if (!cache[a])
+				cache[a] = { n: '', t: now };
+
+		// Keep the cache small.
+		const ks = keys(cache);
+		if (length(ks) > 2000)
+			for (let k in slice(sort(ks, (x, y) => cache[x].t - cache[y].t), 0, length(ks) - 2000))
+				delete cache[k];
+
+		writefile(file, sprintf('%J', cache));
+	}
+
+	const out = {};
+	for (let a in addrs)
+		if (cache[a]?.n)
+			out[a] = cache[a].n;
+
+	return out;
+}
+
 // ---------------------------------------------------------------- methods
 
 const methods = {
@@ -362,6 +527,44 @@ const methods = {
 				snort: snort_alerts(ip),
 				addrwatch: addrwatch(ip, mac)
 			};
+		}
+	},
+
+	names: {
+		args: { ip: '', addrs: [], ptr: true },
+		call: function(req) {
+			const ip = req.args?.ip;
+			if (!valid_ip(ip))
+				return { error: 'invalid address' };
+
+			const addrs = slice(filter(req.args?.addrs ?? [], valid_ip), 0, 100);
+			const res = {};
+			let left = {};
+
+			for (let a in addrs)
+				left[a] = true;
+
+			const take = (found, source) => {
+				for (let a, n in found)
+					if (left[a]) {
+						res[a] = { name: n, source: source };
+						delete left[a];
+					}
+			};
+
+			take(local_names(), 'lan');
+
+			const files = querylog_files();
+			if (length(keys(left)))
+				take(dns_names(files, left, ip), 'dns');
+			if (length(keys(left)))
+				take(dns_names(files, left, null), 'dns-other');
+			if (req.args?.ptr !== false && length(keys(left))) {
+				mkdir(STATE);
+				take(ptr_names(filter(keys(left), (a) => !match(a, /^(255\.|0\.|22[4-9]\.|23\d\.)/))), 'ptr');
+			}
+
+			return { names: res, querylog: length(files) > 0 };
 		}
 	},
 

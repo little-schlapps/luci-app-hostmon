@@ -13,7 +13,7 @@ LUCI_PKGARCH:=all
 
 # Explicit version for standalone releases; luci.mk would otherwise derive
 # one from the git history of the LuCI feed.
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.1.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=Apache-2.0

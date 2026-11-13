@@ -10,6 +10,7 @@ const callLeases = rpc.declare({ object: 'luci-rpc', method: 'getDHCPLeases', ex
 const callRate = rpc.declare({ object: 'luci.hostmon', method: 'rate', params: [ 'ip' ], expect: { } });
 const callConns = rpc.declare({ object: 'luci.hostmon', method: 'conns', params: [ 'ip' ], expect: { } });
 const callHost = rpc.declare({ object: 'luci.hostmon', method: 'host', params: [ 'ip' ], expect: { } });
+const callNames = rpc.declare({ object: 'luci.hostmon', method: 'names', params: [ 'ip', 'addrs' ], expect: { names: {} } });
 const callCrowdsec = rpc.declare({ object: 'luci.hostmon', method: 'crowdsec', params: [ 'ip' ], expect: { } });
 
 const SAMPLES = 150;		// 2 s apart: 5 minutes of history
@@ -113,9 +114,35 @@ function renderInfo(h, ip) {
 	]);
 }
 
-function renderConns(c, filter) {
+const NAME_SOURCES = {
+	'dns': [ 'DNS', _('Name this device looked up (AdGuard query log)') ],
+	'dns-other': [ 'DNS*', _('Name another device looked up for this address (AdGuard query log)') ],
+	'lan': [ 'LAN', _('Local device name (DHCP lease, reservation or router interface)') ],
+	'ptr': [ 'rDNS', _('Reverse DNS (PTR) record: names the server, not necessarily the service') ]
+};
+
+// Remote address cell: resolved name with the address underneath.
+function addrCell(names, ip, port) {
+	const n = names[ip];
+	const addr = port ? '%s:%s'.format(ip, port) : ip;
+
+	if (!n || !n.name)
+		return addr;
+
+	const src = NAME_SOURCES[n.source] || [ '?', '' ];
+
+	return E('span', { 'title': src[1] }, [
+		E('span', { 'style': 'word-break:break-all' }, [ n.name ]), ' ',
+		E('small', { 'style': 'opacity:.55;border:1px solid currentColor;border-radius:3px;padding:0 3px;font-size:70%' }, [ src[0] ]),
+		E('br'),
+		E('small', { 'style': 'opacity:.7' }, [ addr ])
+	]);
+}
+
+function renderConns(c, filter, names) {
+	names = names || {};
 	const f = (filter || '').toLowerCase();
-	const list = (c.conns || []).filter(x => !f || [ x.remote, x.remote_port, x.proto, svc(x.proto, x.remote_port) || '' ].join(' ').toLowerCase().indexOf(f) >= 0);
+	const list = (c.conns || []).filter(x => !f || [ x.remote, x.remote_port, x.proto, svc(x.proto, x.remote_port) || '', (names[x.remote] || {}).name || '' ].join(' ').toLowerCase().indexOf(f) >= 0);
 
 	const remotes = {};
 	(c.conns || []).forEach(x => {
@@ -132,7 +159,7 @@ function renderConns(c, filter) {
 			E('div', { 'style': 'flex:1;min-width:320px' }, [
 				E('h4', [ _('Top remote addresses (current connections)') ]),
 				table([ _('Address'), _('Ports'), _('Conns'), _('Down'), _('Up') ],
-					top.map(r => [ r.ip, Object.keys(r.ports).slice(0, 4).join(', '), String(r.conns), fmtBytes(r.rx), fmtBytes(r.tx) ]),
+					top.map(r => [ addrCell(names, r.ip), Object.keys(r.ports).slice(0, 4).join(', '), String(r.conns), fmtBytes(r.rx), fmtBytes(r.tx) ]),
 					_('No connections'))
 			])
 		]),
@@ -140,7 +167,7 @@ function renderConns(c, filter) {
 		table([ _('Dir'), _('Proto'), _('Local port'), _('Remote'), _('Service'), _('State'), _('Down'), _('Up') ],
 			list.slice(0, 100).map(x => [
 				x.direction == 'out' ? '→' : '←', x.proto, String(x.local_port || '-'),
-				'%s:%s'.format(x.remote, x.remote_port || '-'),
+				addrCell(names, x.remote, x.remote_port || '-'),
 				svc(x.proto, x.remote_port) || svc(x.proto, x.local_port) || '-',
 				x.state || (x.assured ? _('assured') : _('unreplied')),
 				fmtBytes(x.rx_bytes), fmtBytes(x.tx_bytes)
@@ -243,7 +270,7 @@ return view.extend({
 		const samples = [];
 		let last = null, peakRx = 0, peakTx = 0, lastConns = { conns: [] }, lastHost = null, lastCs = null;
 
-		filter.addEventListener('input', () => dom.content(conns, renderConns(lastConns, filter.value)));
+		filter.addEventListener('input', () => redraw());
 
 		const tickRate = () => callRate(ip).then(r => {
 			if (!r || r.error)
@@ -268,9 +295,60 @@ return view.extend({
 			drawGraph(svg, samples);
 		});
 
+		// Name cache: addr -> { name, source, at }. Addresses with no DNS-log name are retried
+		// every minute, since the device may look the name up again later.
+		const names = {};
+		const asked = {};
+		let resolving = false;
+		let resolveOn = true;
+		try { resolveOn = localStorage.getItem('hostmon.resolve') !== 'off'; } catch (e) {}
+
+		const shown = () => resolveOn ? names : {};
+		const redraw = () => dom.content(conns, renderConns(lastConns, filter.value, shown()));
+
+		const resolve = () => {
+			if (!resolveOn || resolving)
+				return Promise.resolve();
+
+			const now = Date.now();
+			const todo = [];
+
+			(lastConns.conns || []).forEach(x => {
+				const n = names[x.remote];
+				const settled = n && (n.source == 'dns' || n.source == 'lan');
+				if (!settled && !(asked[x.remote] > now - 60000) && todo.indexOf(x.remote) < 0)
+					todo.push(x.remote);
+			});
+
+			if (!todo.length)
+				return Promise.resolve();
+
+			todo.slice(0, 100).forEach(a => { asked[a] = now; });
+			resolving = true;
+
+			return callNames(ip, todo.slice(0, 100)).then(res => {
+				Object.keys(res || {}).forEach(a => { names[a] = res[a]; });
+				redraw();
+			}).finally(() => { resolving = false; });
+		};
+
+		const resolveToggle = E('label', { 'style': 'display:inline-flex;gap:.4em;align-items:center;margin-left:1em' }, [
+			E('input', {
+				'type': 'checkbox', 'checked': resolveOn ? 'checked' : null,
+				'change': ev => {
+					resolveOn = ev.target.checked;
+					try { localStorage.setItem('hostmon.resolve', resolveOn ? 'on' : 'off'); } catch (e) {}
+					redraw();
+					resolve();
+				}
+			}),
+			_('Resolve names')
+		]);
+
 		const tickConns = () => callConns(ip).then(c => {
 			lastConns = c || { conns: [] };
-			dom.content(conns, renderConns(lastConns, filter.value));
+			redraw();
+			return resolve();
 		});
 
 		const tickHost = () => callHost(ip).then(h => {
@@ -306,7 +384,14 @@ return view.extend({
 				])
 			]),
 			E('div', { 'class': 'cbi-section' }, [ E('h3', [ _('Device') ]), info ]),
-			E('div', { 'class': 'cbi-section' }, [ E('h3', [ _('Current connections') ]), filter, conns ]),
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', [ _('Current connections') ]),
+				E('div', { 'style': 'display:flex;flex-wrap:wrap;align-items:center;gap:.5em' }, [ filter, resolveToggle ]),
+				E('div', { 'class': 'cbi-section-descr' }, [
+					_('Names come from, in order: the name this device looked up (DNS), a name another device looked up (DNS*), local device names (LAN), or reverse DNS (rDNS, which names the server rather than the service). Hover a name for its source.')
+				]),
+				conns
+			]),
 			E('div', { 'class': 'cbi-section' }, [ E('h3', [ _('Usage this period (nlbwmon)') ]), usage ]),
 			E('div', { 'class': 'cbi-section' }, [ E('h3', [ _('Security') ]), security ])
 		]);
